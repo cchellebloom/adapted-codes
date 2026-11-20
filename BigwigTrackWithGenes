@@ -1,0 +1,178 @@
+######## The original function BigwigTrack() belongs to the R package Signac! Here, I made the following modifications to it:
+##     - annotate genes with their symbols and with arrows (with +/- directionality) spanning the length of the gene. Annotations appear under the tracks (argument show.genes)
+##     - enable specified scaling of bigwig tracks to each other. This is a feature of IGV and thought it would be useful to include it here 
+##     - adjust some of the aesthetic to make publication-ready
+
+BigwigTrackWithGenes <- function(
+    region,
+    bigwig,
+    smooth = 200,
+    extend.upstream = 0,
+    extend.downstream = 0,
+    type = "coverage",
+    y_label = "bigWig",
+    bigwig.scale = "common",
+    ymax = NULL,
+    max.downsample = 3000,
+    downsample.rate = 0.1,
+    txdb = NULL,
+    genome = "mm10",
+    show.genes = TRUE,
+    scale.groups = NULL
+) {
+  # ----- handle region input (accept chr:start-end or chr-start-end) -----
+  ### this part ensures that objecgts with different locus nomenclature still can be processed
+  if (!inherits(region, "GRanges")) {
+    region <- gsub(":", "-", region)
+    parts <- strsplit(region, "-")[[1]]
+    region <- GenomicRanges::GRanges(
+      seqnames = parts[1],
+      ranges = IRanges::IRanges(
+        start = as.numeric(parts[2]) - extend.upstream,
+        end   = as.numeric(parts[3]) + extend.downstream
+      )
+    )
+  }
+  # ----- load bigwig data -----
+  if (!inherits(bigwig, "list")) bigwig <- list(bigWig = bigwig)
+  if (!type %in% c("line", "heatmap", "coverage")) stop("Invalid `type`")
+  if (.Platform$OS.type == "windows") {
+    message("BigwigTrack is not supported on Windows."); return(NULL)
+  }
+  if (!requireNamespace("rtracklayer", quietly = TRUE)) {
+    stop("Please install Bioconductor package 'rtracklayer'")
+  }
+  bw.names <- names(bigwig)
+  all.data <- purrr::map2_dfr(bigwig, bw.names, function(path, name) {
+    scores <- rtracklayer::import(con = path, which = region, as = "NumericList")[[1]]
+    if (!is.null(smooth)) {
+      scores <- RcppRoll::roll_mean(scores, n = smooth, fill = 0L)
+    }
+    tibble::tibble(position = seq(start(region), end(region)), score = scores, bw = name)
+  })
+  all.data$bw <- factor(all.data$bw, levels = bw.names)
+  # ----- group autoscaling -----
+  if (!is.null(scale.groups)) {
+    for (grp in scale.groups) {
+      grp.names <- if (is.numeric(grp)) bw.names[grp] else grp
+      grp.data <- dplyr::filter(all.data, bw %in% grp.names)
+      grp.max <- max(grp.data$score, na.rm = TRUE)
+      if (grp.max > 0) {
+        all.data <- all.data %>%
+          dplyr::mutate(score = dplyr::case_when(
+            bw %in% grp.names ~ score / grp.max,
+            TRUE ~ score
+          ))
+      }
+    }
+  } else if (bigwig.scale == "separate") {
+    all.data <- all.data %>%
+      dplyr::group_by(bw) %>%
+      dplyr::mutate(score = score / max(score, na.rm = TRUE)) %>%
+      dplyr::ungroup()
+  }
+  # ----- downsample for plotting -----
+  window.size <- width(region)
+  n.keep <- ceiling(max(max.downsample, window.size * downsample.rate))
+  coverages <- dplyr::slice_sample(all.data, n = n.keep)
+  covmax <- signif(max(coverages$score, na.rm = TRUE), 2)
+  ymax <- if (is.null(ymax)) covmax else {
+    if (is.character(ymax) && startsWith(ymax, "q")) {
+      q <- as.numeric(sub("^q", "", ymax)) / 100
+      covmax * q
+    } else if (is.numeric(ymax)) {
+      ymax
+    } else {
+      stop("Invalid `ymax`")
+    }
+  }
+  coverages$score <- pmin(coverages$score, ymax)
+  chr <- as.character(GenomicRanges::seqnames(region))
+  # ----- build main plot -----
+  # set my placeholders for easier changing!!
+  strandSize = 0.6
+  genelineMargin = -0.30   #the bars/lines that represent the gene span
+  genetextMargin = genelineMargin - 0.08     #gene symbol text annotation goes below the line (fixed)
+  plotMargins = c(5,5,5,5)
+  lowest_margin <- min(genelineMargin, genetextMargin)  # both are negative
+  p <- ggplot2::ggplot(coverages, ggplot2::aes(position, score, fill = bw)) +
+    ggplot2::geom_area() +
+    ggplot2::facet_wrap(~bw, strip.position = "left", ncol = 1, scales = "fixed") +
+    ggplot2::scale_y_continuous(limits = c((lowest_margin - 0.1) * ymax, ymax), expand = c(0, 0)) +
+    ggplot2::scale_x_continuous(position = "top") +
+    Signac::theme_browser(axis.text.y = TRUE) +
+    ggplot2::ylab(y_label) +
+    ggplot2::theme(
+      axis.title.x.bottom = ggplot2::element_blank(),
+      axis.text.x.bottom  = ggplot2::element_blank(),
+      axis.ticks.x.bottom = ggplot2::element_blank(),
+      axis.title.x.top = ggplot2::element_text(margin = ggplot2::margin(b = 5)),
+      axis.text.x.top  = ggplot2::element_text(),
+      strip.placement  = "outside",
+      panel.spacing    = grid::unit(0.0, "lines"),
+      plot.margin      = grid::unit(plotMargins, "pt")  # should I put extra bottom margin?? idk
+    ) +
+    ggplot2::xlab(paste0(chr, " position (bp)"))
+  # ----- gene annotations with strand-aware arrows -----
+  if (!is.null(txdb) && show.genes) {
+    gm <- GenomicFeatures::genes(txdb)
+    hits <- GenomicRanges::findOverlaps(gm, region)
+    gm <- gm[S4Vectors::queryHits(hits)]
+    gm <- GenomicRanges::pintersect(gm, region)
+    if (length(gm) > 0) {
+      gene.df <- as.data.frame(gm)
+      gene.df$symbol <- AnnotationDbi::mapIds(
+        org.Mm.eg.db,
+        keys = gene.df$gene_id,
+        column = "SYMBOL",
+        keytype = "ENTREZID",
+        multiVals = "first"
+      )
+      gene.df$strand <- as.character(strand(gm))
+      bottom_bw <- tail(bw.names, 1)
+      gene.df$bw <- factor(bottom_bw, levels = bw.names)
+      gene.df.plus  <- subset(gene.df, strand == "+")
+      gene.df.minus <- subset(gene.df, strand == "-")
+      p <- p +
+        # plus strand: arrow points right
+        ggplot2::geom_segment(
+          data = gene.df.plus,
+          ggplot2::aes(
+            x = start,
+            xend = end,
+            y = genelineMargin * ymax,      # pushed further down
+            yend = genelineMargin * ymax
+          ),
+          inherit.aes = FALSE,
+          size = strandSize,
+          arrow = grid::arrow(length = grid::unit(3, "pt"), type = "closed", ends = "last")
+        ) +
+        # minus strand: arrow points left
+        ggplot2::geom_segment(
+          data = gene.df.minus,
+          ggplot2::aes(
+            x = end,
+            xend = start,
+            y = genelineMargin * ymax,
+            yend = genelineMargin * ymax
+          ),
+          inherit.aes = FALSE,
+          size = strandSize,
+          arrow = grid::arrow(length = grid::unit(3, "pt"), type = "closed", ends = "last")
+        ) +
+        ggplot2::geom_text(
+          data = gene.df,
+          ggplot2::aes(
+            x = (start + end) / 2,
+            y = genetextMargin * ymax,       # also pushed further down
+            label = symbol
+          ),
+          inherit.aes = FALSE,
+          size = 3,
+          vjust = 1,
+          angle = 0
+        )
+    }
+  }
+  return(p)
+}
